@@ -6,12 +6,14 @@
 #include <thrust/device_vector.h>
 #include <thrust/extrema.h>
 
+#define MATX_ENABLE_PYBIND11 1
+
 #include "matx.h"
 
 namespace py = pybind11;
 
-const SAMPLES_PER_SPECTRA = 1; // TODO
-const SPECTRA_PER_RUN = 1; //TODO
+const SAMPLES_PER_SPECTRA = 4603; // TODO
+const SPECTRA_PER_RUN = 100; //TODO
 
 const double FRAUNHOFER_LINES[] = {
     898.765,  // O2
@@ -48,22 +50,17 @@ const double FRAUNHOFER_LINES[] = {
 
 const double WIEN_B = 2.897771955e-3
 
-__global__
-void kernel(const double* models, const bool* out_elements) {
-    double target_wavelength = FRAUNHOFER_LINES[threadIdx.y];
-}
-
 struct AnalyzeResult {
-    temperature: double;
-    classification: short;
-    elements: py::array_t<_>;
+    temperature: float; // Provides better alignment than using a double. We don't really need double precision here
+    elements: uint32_t;
+    classification: uint8_t; // Should we be using a bit vector..?
 }
 
 // `py::array::c_style | py::array::forcecast` restricts this to only accept "dense"
 // arrays that we can directly reinterpret as a row-major `double*`
 //
 // https://pybind11.readthedocs.io/en/stable/advanced/pycpp/numpy.html#arrays
-AnalyzeResult stargaze(
+py::array_t<double> stargaze(
     py::array_t<double, py::array::c_style | py::array::forcecast> py_model,
     double first_wavelength,
     double dispersion_per_pixel
@@ -100,11 +97,7 @@ AnalyzeResult stargaze(
     (temperature = WIEN_B / matx::pow(max_flux, first_wavelength + max_sample_idx * dispersion_per_pixel)).run();
     cudaDeviceSynchronize();
 
-    return {
-        .temperature = 0,
-        .classification = 0,
-        .elements = {},
-    };
+    return matx::MatXPybind().TensorViewToNumpy(temperature);
 }
 
 // Define the Python FFI bindings
