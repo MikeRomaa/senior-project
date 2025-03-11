@@ -1,0 +1,7 @@
+[submodule "src/matx"]
+	path = src/matx
+	url = https://github.com/NVIDIA/MatX
+[submodule "src/pybind11"]
+	path = src/pybind11
+	url = https://github.com/pybind/pybind11
+	branch = stable

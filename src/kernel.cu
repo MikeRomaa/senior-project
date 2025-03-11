@@ -4,14 +4,16 @@
 
 #include <thrust/copy.h>
 #include <thrust/device_vector.h>
+#include <thrust/extrema.h>
 
-#define DEG_TO_RAD 0.01745329251
-#define EARTH_RADIUS_KM 6371.0088
-#define THREADS_PER_BLOCK 1024
+#include "matx.h"
 
 namespace py = pybind11;
-    
-const FRAUNHOFER_LINES = [
+
+const SAMPLES_PER_SPECTRA = 1; // TODO
+const SPECTRA_PER_RUN = 1; //TODO
+
+const double FRAUNHOFER_LINES[] = {
     898.765,  // O2
     822.696,  // O2
     759.370,  // O2
@@ -42,27 +44,13 @@ const FRAUNHOFER_LINES = [
     336.112,  // Ti+
     302.108,  // Fe
     299.444,  // Ni
-]
+};
+
+const double WIEN_B = 2.897771955e-3
 
 __global__
-void haversine(const double* model) {
-    int idx = blockIdx.x * THREADS_PER_BLOCK + threadIdx.x;
-    if (idx >= size)
-    {
-        return;
-    }
-    
-    double phi1 = y1[idx] * DEG_TO_RAD;
-    double phi2 = y2[idx] * DEG_TO_RAD;
-    double lambda1 = x1[idx] * DEG_TO_RAD;
-    double lambda2 = x2[idx] * DEG_TO_RAD;
-    
-    double d_phi = phi2 - phi1;
-    double d_lambda = lambda2 - lambda1;
-    
-    double hav = (1 - cos(d_phi) + cos(phi1) * cos(phi2) * (1 - cos(d_lambda))) / 2;
-    
-    out[idx] = 2 * EARTH_RADIUS_KM * asin(sqrt(hav));
+void kernel(const double* models, const bool* out_elements) {
+    double target_wavelength = FRAUNHOFER_LINES[threadIdx.y];
 }
 
 struct AnalyzeResult {
@@ -71,34 +59,57 @@ struct AnalyzeResult {
     elements: py::array_t<_>;
 }
 
-AnalyzeResult analyze(py::array_t<double> py_model) {
+// `py::array::c_style | py::array::forcecast` restricts this to only accept "dense"
+// arrays that we can directly reinterpret as a row-major `double*`
+//
+// https://pybind11.readthedocs.io/en/stable/advanced/pycpp/numpy.html#arrays
+AnalyzeResult stargaze(
+    py::array_t<double, py::array::c_style | py::array::forcecast> py_model,
+    double first_wavelength,
+    double dispersion_per_pixel
+) {
     py::buffer_info buf_model = py_model.request();
     
-    // Copy the input data to the device
+    assert(
+        buf_model.ndim == 2 &&
+        buf_model.shape[0] == SPECTRA_PER_RUN &&
+        buf_model.shape[1] == SAMPLES_PER_SPECTRA
+    );
+
     double* model = reinterpret_cast<double*>(buf_model.ptr);
-    thrust::device_vector<double> d_model(model, model + buf_model.size);
-    
-    // Run the kernel function
-    int blockSize = ceil((float) buf_model.size / THREADS_PER_BLOCK);
-    haversine<<<blockSize, THREADS_PER_BLOCK>>>(thrust::raw_pointer_cast(d_model.data()));
-    
-    // Allocate new Python array and copy results
-    py::array_t<double> py_out;
-    py::buffer_info buf_out = py_out.request();
-    
-    double* out = reinterpret_cast<double*>(buf_out.ptr);
-    thrust::copy(d_out.begin(), d_out.end(), out);
-    
+
+    // Calculate temperatures by using Wien's displacement law:
+    //
+    //      T = b / λ_peak
+    //
+    // where `b` is Wien's displacement constant, equal to
+    //
+    //      2.897771955e-3 m*K
+    //
+
+    // TODO: Maybe we can use `make_static_tensor`?
+    matx::tensor_t<double, SPECTRA_PER_RUN, SAMPLES_PER_SPECTRA> tensor(model);
+
+    matx::tensor_t<matx::index_t, SPECTRA_PER_RUN> max_sample_idx;
+    matx::tensor_t<double, SPECTRA_PER_RUN> max_flux;
+    matx::tensor_t<double, SPECTRA_PER_RUN> temperature;
+
+    (matx::mtie(max_flux, max_sample_idx) = matx::argmax(tensor)).run();
+    cudaDeviceSynchronize();  // MatX operations are all asynchronous, we need to wait for them to be completed
+
+    (temperature = WIEN_B / matx::pow(max_flux, first_wavelength + max_sample_idx * dispersion_per_pixel)).run();
+    cudaDeviceSynchronize();
+
     return {
         .temperature = 0,
         .classification = 0,
-        .elements = out,
+        .elements = {},
     };
 }
 
 // Define the Python FFI bindings
-PYBIND11_MODULE(haversine, m)
+PYBIND11_MODULE(stargaze, m)
 {
     m.doc() = "Docstring";
-    m.def("analyze", analyze);
+    m.def("stargaze", stargaze);
 }
