@@ -1,9 +1,4 @@
-#define MATX_ENABLE_PYBIND11 1
-#define SAMPLES_PER_SPECTRA 4603_z
-#define SPECTRA_PER_RUN 1_z
 #define WIEN_B 2.897771955e-3
-
-#include <matx.h>
 
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -11,6 +6,11 @@
 
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/discard_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/reduce.h>
+#include <thrust/transform.h>
 
 namespace py = pybind11;
 
@@ -47,8 +47,6 @@ const double FRAUNHOFER_LINES[] = {
     299.444,  // Ni
 };
 
-constexpr size_t operator"" _z(unsigned long long n) { return n; }
-
 // struct AnalyzeResult {
 //     float temperature; // Provides better alignment than using a double. We don't really need double precision here
 //     uint32_t elements;
@@ -56,9 +54,15 @@ constexpr size_t operator"" _z(unsigned long long n) { return n; }
 // };
 
 struct get_star_idx {
+    size_t samples_per_spectra;
+
+    __host__
+    get_star_idx(size_t _samples_per_spectra):
+        samples_per_spectra(_samples_per_spectra) {}
+
     __device__
     size_t operator()(size_t idx) const {
-        return idx / SAMPLES_PER_SPECTRA;
+        return idx / samples_per_spectra;
     }
 };
 
@@ -74,17 +78,19 @@ struct max_flux_idx {
 };
 
 struct get_temperature {
+    size_t samples_per_spectra;
     float first_wavelength;
     float dispersion_per_pixel;
 
     __host__
-    get_temperature(float _first_wavelength, float _dispersion_per_pixel):
+    get_temperature(size_t _samples_per_spectra, float _first_wavelength, float _dispersion_per_pixel):
+        samples_per_spectra(_samples_per_spectra),
         first_wavelength(_first_wavelength),
         dispersion_per_pixel(_dispersion_per_pixel) {}
 
     __device__
     float operator()(size_t star_idx, size_t idx) const {
-        size_t offset = idx - star_idx * SAMPLES_PER_SPECTRA;
+        size_t offset = idx - star_idx * samples_per_spectra;
         float wavelength = __exp10f(first_wavelength + offset * dispersion_per_pixel);
 
         return WIEN_B / wavelength;
@@ -95,19 +101,27 @@ struct get_temperature {
 // arrays that we can directly reinterpret as a row-major `double*`
 //
 // https://pybind11.readthedocs.io/en/stable/advanced/pycpp/numpy.html#arrays
-py::array_t<float> temperatures(
+py::tuple temperatures(
     py::array_t<double, py::array::c_style | py::array::forcecast> py_model,
     float first_wavelength,
     float dispersion_per_pixel
 ) {
     py::buffer_info buf_model = py_model.request();
 
-    assert(buf_model.ndim == 2);
-    assert(buf_model.shape[0] == SPECTRA_PER_RUN);
-    assert(buf_model.shape[1] == SAMPLES_PER_SPECTRA);
+    size_t spectra_per_run;
+    size_t samples_per_spectra;
+    size_t buf_size = buf_model.size;
+
+    if (buf_model.ndim == 2) {
+        spectra_per_run = buf_model.shape[0];
+        samples_per_spectra = buf_model.shape[1];
+    } else {
+        spectra_per_run = 1;
+        samples_per_spectra = buf_model.shape[0];
+    }
 
     double* model = reinterpret_cast<double*>(buf_model.ptr);
-    thrust::device_vector<double> d_model(model, model + SPECTRA_PER_RUN * SAMPLES_PER_SPECTRA);
+    thrust::device_vector<double> d_model(model, model + buf_size);
 
     // Calculate temperatures by using Wien's displacement law:
     //
@@ -120,14 +134,14 @@ py::array_t<float> temperatures(
 
     // The star index will act as our key in the following reduction,
     // since we want to get the highest-flux wavelength for EACH star.
-    thrust::counting_iterator idx_begin = thrust::make_counting_iterator(0_z);
-    thrust::counting_iterator idx_end = thrust::make_counting_iterator(SPECTRA_PER_RUN * SAMPLES_PER_SPECTRA);
+    auto idx_begin = thrust::make_counting_iterator<size_t>(0);
+    auto idx_end = thrust::make_counting_iterator<size_t>(buf_size);
 
-    thrust::transform_iterator idx_star_begin = thrust::make_transform_iterator(idx_begin, get_star_idx());
-    thrust::transform_iterator idx_star_end = thrust::make_transform_iterator(idx_end, get_star_idx());
+    auto idx_star_begin = thrust::make_transform_iterator(idx_begin, get_star_idx(samples_per_spectra));
+    auto idx_star_end = thrust::make_transform_iterator(idx_end, get_star_idx(samples_per_spectra));
 
     // First we find the index where the maximum flux occurs
-    thrust::device_vector<double> d_max_flux_idx(SPECTRA_PER_RUN);
+    thrust::device_vector<size_t> d_max_flux_idx(spectra_per_run);
     thrust::reduce_by_key(
         idx_star_begin,
         idx_star_end,
@@ -144,21 +158,29 @@ py::array_t<float> temperatures(
         max_flux_idx()
     );
 
-    thrust::device_vector<float> d_temperatures(SPECTRA_PER_RUN);
+    thrust::device_vector<float> d_temperatures(spectra_per_run);
     thrust::transform(
         idx_star_begin,
         idx_star_end,
         d_max_flux_idx.begin(),
         d_temperatures.begin(),
-        get_temperature(first_wavelength, dispersion_per_pixel)
+        get_temperature(samples_per_spectra, first_wavelength, dispersion_per_pixel)
     );
 
+    thrust::host_vector<size_t> max_flux_idx(d_max_flux_idx);
     thrust::host_vector<float> temperatures(d_temperatures);
 
-    return py::array_t<float>(
-        { SPECTRA_PER_RUN },
-        { sizeof(float) },
-        thrust::raw_pointer_cast(temperatures.data())
+    return py::make_tuple(
+        py::array_t<size_t>(
+            { spectra_per_run },
+            { sizeof(size_t) },
+            thrust::raw_pointer_cast(max_flux_idx.data())
+        ),
+        py::array_t<float>(
+            { spectra_per_run },
+            { sizeof(float) },
+            thrust::raw_pointer_cast(temperatures.data())
+        )
     );
 }
 
