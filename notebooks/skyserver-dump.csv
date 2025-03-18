@@ -1,4 +1,3 @@
-#Table1
 plate,mjd,fiber,version,url
 1523,52937,345,26,https://dr18.sdss.org/sas/dr18/spectro/sdss/redux/26/spectra/lite/1523/spec-1523-52937-0345.fits
 2421,54153,94,26,https://dr18.sdss.org/sas/dr18/spectro/sdss/redux/26/spectra/lite/2421/spec-2421-54153-0094.fits

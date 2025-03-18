@@ -443,3 +443,12 @@ FodyWeavers.xsd
 # Additional files built by Visual Studio
 
 # End of https://www.toptal.com/developers/gitignore/api/cmake,visualstudiocode,visualstudio,cuda
+
+### Added Manually ###
+
+.vscode
+cmake
+rapids-cmake
+cpm-package-lock.cmake
+CPM_modules
+stargaze.so
