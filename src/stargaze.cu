@@ -50,11 +50,7 @@ const double FRAUNHOFER_LINES[] = {
 struct max_flux_idx {
     __device__
     thrust::tuple<size_t, double> operator()(const thrust::tuple<size_t, double> &a, const thrust::tuple<size_t, double> &b) {
-        if (thrust::get<1>(b) > thrust::get<1>(a)) {
-            return b;
-        }
-
-        return a;
+        return thrust::get<1>(b) > thrust::get<1>(a) ? b : a;
     }
 };
 
