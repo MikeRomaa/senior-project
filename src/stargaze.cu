@@ -47,12 +47,6 @@ const double FRAUNHOFER_LINES[] = {
     299.444,  // Ni
 };
 
-// struct AnalyzeResult {
-//     float temperature; // Provides better alignment than using a double. We don't really need double precision here
-//     uint32_t elements;
-//     uint8_t classification; // Should we be using a bit vector..?
-// };
-
 struct max_flux_idx {
     __device__
     thrust::tuple<size_t, double> operator()(const thrust::tuple<size_t, double> &a, const thrust::tuple<size_t, double> &b) {
@@ -90,10 +84,10 @@ struct get_temperature {
 //
 // where `b` is Wien's displacement constant, equal to
 //
-//      2.897771955e-3 m*K
+//      28,980,000 Å*K
 //
-// `py::array::c_style | py::array::forcecast` restricts this to only accept "dense"
-// arrays that we can directly reinterpret as a row-major `double*`
+// The parameter type `py::array::c_style | py::array::forcecast` restricts this to only
+// accept "dense" arrays that we can directly reinterpret as a row-major `double*`
 //
 // https://pybind11.readthedocs.io/en/stable/advanced/pycpp/numpy.html#arrays
 py::array_t<float> temperatures(
@@ -120,11 +114,14 @@ py::array_t<float> temperatures(
 
     // The star index will act as our key in the following reduction,
     // since we want to get the highest-flux wavelength for EACH star.
+
     auto idx_begin = thrust::make_counting_iterator<size_t>(0);
     auto idx_end = thrust::make_counting_iterator<size_t>(buf_size);
 
     auto idx_star_begin = thrust::make_transform_iterator(idx_begin, thrust::placeholders::_1 / samples_per_spectra);
     auto idx_star_end = thrust::make_transform_iterator(idx_end, thrust::placeholders::_1 / samples_per_spectra);
+
+    auto idx_sample_begin = thrust::make_transform_iterator(idx_begin, thrust::placeholders::_1 % samples_per_spectra);
 
     // First we find the index where the maximum flux occurs
     thrust::device_vector<size_t> d_max_flux_idx(spectra_per_run);
@@ -132,7 +129,7 @@ py::array_t<float> temperatures(
         idx_star_begin,
         idx_star_end,
         thrust::make_zip_iterator(thrust::make_tuple(
-            idx_begin,
+            idx_sample_begin,
             d_model.begin()
         )),
         thrust::make_discard_iterator(), // We don't care about the index of the star in the output
@@ -142,13 +139,6 @@ py::array_t<float> temperatures(
         )),
         thrust::equal_to<size_t>(),
         max_flux_idx()
-    );
-
-    thrust::transform(
-        d_max_flux_idx.begin(),
-        d_max_flux_idx.end(),
-        d_max_flux_idx.begin(),
-        thrust::placeholders::_1 % samples_per_spectra
     );
 
     thrust::device_vector<float> d_temperatures(spectra_per_run);
