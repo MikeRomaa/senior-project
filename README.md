@@ -33,7 +33,7 @@ To prove to ourselves that the data from SDSS can be read, and that we can reaso
 - [`download_fits.ipynb`](./notebooks/download_fits.ipynb) is about gauging just how much data we are dealing with and if there is any way to slim it down to just the essentials.
 
     Here we make use of another one of SDSS's services—the [SQL search engine](https://skyserver.sdss.org/dr18/SearchTools/sql)—to generate download links for several different spectrographs. When we were playing around with the FITS files earlier, we were using a link embedded on the website that looked like this:
-    
+
     ```
     https://dr18.sdss.org/sas/dr18/spectro/sdss/redux/v5_13_2/spectra/lite/6413/spec-6413-56336-0516.fits
     ```
@@ -70,7 +70,10 @@ To prove to ourselves that the data from SDSS can be read, and that we can reaso
         ) AS url
     FROM SpecObj AS spec
     -- Filters out any spectra that have known problems
-    WHERE spec.zWarning = 0
+    WHERE
+        spec.zWarning = 0 AND
+        spec.class = "STAR"
+    ORDER BY NEWID()
     ```
 
     We used what we learned from poking at the FITS files and identified the minimal required data that we needed, and removed the rest for each file we are processing. For 100 files, we started with a total size of around 22 MB and got that down to just 4 MB.
