@@ -1,5 +1,8 @@
 #define WIEN_B 28980000
 
+#include <stdexcept>
+
+#include <pybind11/iostream.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -12,7 +15,10 @@
 #include <thrust/reduce.h>
 #include <thrust/transform.h>
 
+#define LOG(LEVEL, FORMAT, ...) printf("%5s [stargaze::%s:%d] " FORMAT "\n", #LEVEL, __func__, __LINE__ __VA_OPT__(,) __VA_ARGS__)
+
 namespace py = pybind11;
+using namespace std::literals;
 
 const double FRAUNHOFER_LINES[] = {
     898.765,  // O2
@@ -48,7 +54,7 @@ const double FRAUNHOFER_LINES[] = {
 };
 
 struct Data {
-    float temperature;
+    uint16_t temperature;
 };
 
 struct max_flux_idx {
@@ -73,7 +79,7 @@ struct get_temperature {
         dispersion_per_pixel(_dispersion_per_pixel) {}
 
     __device__
-    float operator()(const thrust::tuple<size_t, size_t, double> &values) const {
+    uint16_t operator()(const thrust::tuple<size_t, size_t, double> &values) const {
         size_t star_idx = thrust::get<0>(values);
         size_t idx = thrust::get<1>(values);
         double redshift = thrust::get<2>(values);
@@ -87,7 +93,7 @@ struct get_temperature {
 
 struct gather_data {
     __device__
-    Data operator()(float temperature) const {
+    Data operator()(uint16_t temperature) const {
         return {
             .temperature = temperature,
         };
@@ -112,6 +118,8 @@ py::array_t<Data> temperatures(
     float first_wavelength,
     float dispersion_per_pixel
 ) {
+    LOG(INFO, "entering function");
+
     py::buffer_info buf_model = py_model.request();
     py::buffer_info buf_redshift = py_redshift.request();
 
@@ -127,8 +135,19 @@ py::array_t<Data> temperatures(
         samples_per_spectra = buf_model.shape[0];
     }
 
-    assert(buf_redshift.ndim == 1);
-    assert(buf_redshift.size == spectra_per_run);
+    LOG(INFO, "spectra_per_run=%zu samples_per_spectra=%zu", spectra_per_run, samples_per_spectra);
+
+    if (buf_redshift.ndim != 1) {
+        LOG(ERROR, "buf_redshift.size=%zu", buf_redshift.size);
+        throw std::runtime_error("expected `redshift` to be 1-dimensional");
+    }
+
+    if (buf_redshift.size != spectra_per_run) {
+        LOG(ERROR, "buf_redshift.size=%zu", buf_redshift.size);
+        throw std::runtime_error("expected `redshift` to have same dimension on axis 0 as `model`");
+    }
+
+    auto start = std::chrono::steady_clock::now();
 
     double* model = reinterpret_cast<double*>(buf_model.ptr);
     double* redshift = reinterpret_cast<double*>(buf_redshift.ptr);
@@ -146,6 +165,8 @@ py::array_t<Data> temperatures(
     auto idx_star_end = thrust::make_transform_iterator(idx_end, thrust::placeholders::_1 / samples_per_spectra);
 
     auto idx_sample_begin = thrust::make_transform_iterator(idx_begin, thrust::placeholders::_1 % samples_per_spectra);
+
+    LOG(INFO, "calling `reduce_by_key`");
 
     // First we find the index where the maximum flux occurs
     thrust::device_vector<size_t> d_max_flux_idx(spectra_per_run);
@@ -165,7 +186,9 @@ py::array_t<Data> temperatures(
         max_flux_idx()
     );
 
-    thrust::device_vector<float> d_temperatures(spectra_per_run);
+    LOG(INFO, "calling `transform`");
+
+    thrust::device_vector<uint16_t> d_temperatures(spectra_per_run);
     thrust::transform(
         thrust::make_zip_iterator(thrust::make_tuple(
             idx_star_begin,
@@ -181,6 +204,8 @@ py::array_t<Data> temperatures(
         get_temperature(samples_per_spectra, first_wavelength, dispersion_per_pixel)
     );
 
+    LOG(INFO, "calling `transform`");
+
     thrust::device_vector<Data> d_data(spectra_per_run);
     thrust::transform(
         d_temperatures.begin(),
@@ -190,6 +215,10 @@ py::array_t<Data> temperatures(
     );
 
     thrust::host_vector<Data> data(d_data);
+
+    auto end = std::chrono::steady_clock::now();
+
+    LOG(INFO, "finished in %ldms", (end - start) / 1ms);
 
     return py::array_t<Data>(
         { spectra_per_run },
@@ -204,5 +233,9 @@ PYBIND11_MODULE(stargaze, m)
     PYBIND11_NUMPY_DTYPE(Data, temperature);
 
     m.doc() = "";
-    m.def("temperatures", temperatures);
+    m.def(
+        "temperatures",
+        temperatures, 
+        py::call_guard<py::scoped_ostream_redirect, py::scoped_estream_redirect>()
+    );
 }
