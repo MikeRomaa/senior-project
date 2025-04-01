@@ -47,9 +47,16 @@ const double FRAUNHOFER_LINES[] = {
     299.444,  // Ni
 };
 
+struct Data {
+    float temperature;
+};
+
 struct max_flux_idx {
     __device__
-    thrust::tuple<size_t, double> operator()(const thrust::tuple<size_t, double> &a, const thrust::tuple<size_t, double> &b) {
+    thrust::tuple<size_t, double> operator()(
+        const thrust::tuple<size_t, double> &a,
+        const thrust::tuple<size_t, double> &b
+    ) {
         return thrust::get<1>(b) > thrust::get<1>(a) ? b : a;
     }
 };
@@ -66,11 +73,24 @@ struct get_temperature {
         dispersion_per_pixel(_dispersion_per_pixel) {}
 
     __device__
-    float operator()(size_t star_idx, size_t idx) const {
+    float operator()(const thrust::tuple<size_t, size_t, double> &values) const {
+        size_t star_idx = thrust::get<0>(values);
+        size_t idx = thrust::get<1>(values);
+        double redshift = thrust::get<2>(values);
+
         size_t offset = idx - star_idx * samples_per_spectra;
-        float wavelength = __exp10f(first_wavelength + offset * dispersion_per_pixel);
+        float wavelength = __exp10f(first_wavelength + offset * dispersion_per_pixel) / (1 + redshift);
 
         return WIEN_B / wavelength;
+    }
+};
+
+struct gather_data {
+    __device__
+    Data operator()(float temperature) const {
+        return {
+            .temperature = temperature,
+        };
     }
 };
 
@@ -86,12 +106,14 @@ struct get_temperature {
 // accept "dense" arrays that we can directly reinterpret as a row-major `double*`
 //
 // https://pybind11.readthedocs.io/en/stable/advanced/pycpp/numpy.html#arrays
-py::array_t<float> temperatures(
+py::array_t<Data> temperatures(
     py::array_t<double, py::array::c_style | py::array::forcecast> py_model,
+    py::array_t<double, py::array::c_style | py::array::forcecast> py_redshift,
     float first_wavelength,
     float dispersion_per_pixel
 ) {
     py::buffer_info buf_model = py_model.request();
+    py::buffer_info buf_redshift = py_redshift.request();
 
     size_t spectra_per_run;
     size_t samples_per_spectra;
@@ -105,8 +127,14 @@ py::array_t<float> temperatures(
         samples_per_spectra = buf_model.shape[0];
     }
 
+    assert(buf_redshift.ndim == 1);
+    assert(buf_redshift.size == spectra_per_run);
+
     double* model = reinterpret_cast<double*>(buf_model.ptr);
-    thrust::device_vector<double> d_model(model, model + buf_size);
+    double* redshift = reinterpret_cast<double*>(buf_redshift.ptr);
+
+    thrust::device_vector<double> d_model(model, model + buf_model.size);
+    thrust::device_vector<double> d_redshift(redshift, redshift + buf_redshift.size);
 
     // The star index will act as our key in the following reduction,
     // since we want to get the highest-flux wavelength for EACH star.
@@ -139,25 +167,42 @@ py::array_t<float> temperatures(
 
     thrust::device_vector<float> d_temperatures(spectra_per_run);
     thrust::transform(
-        idx_star_begin,
-        idx_star_end,
-        d_max_flux_idx.begin(),
+        thrust::make_zip_iterator(thrust::make_tuple(
+            idx_star_begin,
+            d_max_flux_idx.begin(),
+            d_redshift.begin()
+        )),
+        thrust::make_zip_iterator(thrust::make_tuple(
+            idx_star_end,
+            d_max_flux_idx.end(),
+            d_redshift.end()
+        )),
         d_temperatures.begin(),
         get_temperature(samples_per_spectra, first_wavelength, dispersion_per_pixel)
     );
 
-    thrust::host_vector<float> temperatures(d_temperatures);
+    thrust::device_vector<Data> d_data(spectra_per_run);
+    thrust::transform(
+        d_temperatures.begin(),
+        d_temperatures.end(),
+        d_data.begin(),
+        gather_data()
+    );
 
-    return py::array_t<float>(
+    thrust::host_vector<Data> data(d_data);
+
+    return py::array_t<Data>(
         { spectra_per_run },
-        { sizeof(float) },
-        thrust::raw_pointer_cast(temperatures.data())
+        { sizeof(Data) },
+        thrust::raw_pointer_cast(data.data())
     );
 }
 
 // Define the Python FFI bindings
 PYBIND11_MODULE(stargaze, m)
 {
+    PYBIND11_NUMPY_DTYPE(Data, temperature);
+
     m.doc() = "";
     m.def("temperatures", temperatures);
 }
