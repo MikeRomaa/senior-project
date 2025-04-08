@@ -7,15 +7,21 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include <thrust/device_vector.h>
-#include <thrust/host_vector.h>
-#include <thrust/iterator/counting_iterator.h>
-#include <thrust/iterator/discard_iterator.h>
-#include <thrust/iterator/transform_iterator.h>
-#include <thrust/reduce.h>
-#include <thrust/transform.h>
-
 #define LOG(LEVEL, FORMAT, ...) printf("%5s [stargaze::%s:%d] " FORMAT "\n", #LEVEL, __func__, __LINE__ __VA_OPT__(,) __VA_ARGS__)
+
+#define CUDA_CHECK(ERROR_CODE) {                            \
+    do {                                                    \
+        if (ERROR_CODE != cudaSuccess) {                    \
+            LOG(                                            \
+                FATAL, "CUDA error %d: %s",                 \
+                ERROR_CODE, cudaGetErrorString(ERROR_CODE)  \
+            );                                              \
+            throw std::runtime_error(                       \
+                "CUDA error, see logs for more information" \
+            );                                              \
+        }                                                   \
+    } while (0);                                            \
+}
 
 namespace py = pybind11;
 using namespace std::literals;
@@ -53,52 +59,110 @@ const double FRAUNHOFER_LINES[] = {
     299.444,  // Ni
 };
 
-struct Data {
-    uint16_t temperature;
-};
-
-struct max_flux_idx {
-    __device__
-    thrust::tuple<size_t, double> operator()(
-        const thrust::tuple<size_t, double> &a,
-        const thrust::tuple<size_t, double> &b
-    ) {
-        return thrust::get<1>(b) > thrust::get<1>(a) ? b : a;
+__inline__ __device__
+double warp_reduce_max(uint mask, double value) {
+    for (uint offset = warpSize / 2; offset > 0; offset /= 2) {
+        value = max(value, __shfl_down_sync(mask, value, offset));
     }
-};
 
-struct get_temperature {
-    size_t samples_per_spectra;
-    float first_wavelength;
-    float dispersion_per_pixel;
+    return value;
+}
 
-    __host__
-    get_temperature(size_t _samples_per_spectra, float _first_wavelength, float _dispersion_per_pixel):
-        samples_per_spectra(_samples_per_spectra),
-        first_wavelength(_first_wavelength),
-        dispersion_per_pixel(_dispersion_per_pixel) {}
+__inline__ __device__
+double block_reduce_max(double value, size_t num_elements) {
+    static __shared__ double shared[32];
 
-    __device__
-    uint16_t operator()(const thrust::tuple<size_t, size_t, double> &values) const {
-        size_t star_idx = thrust::get<0>(values);
-        size_t idx = thrust::get<1>(values);
-        double redshift = thrust::get<2>(values);
+    uint warp = threadIdx.x / warpSize;
+    uint lane = threadIdx.x % warpSize;
 
-        size_t offset = idx - star_idx * samples_per_spectra;
-        float wavelength = __exp10f(first_wavelength + offset * dispersion_per_pixel) / (1 + redshift);
+    // First we partially reduce each warp within the block
+    // With a maximal block size of 32, this gives us at most 32 partial results
 
-        return WIEN_B / wavelength;
+    bool active = blockIdx.x * blockDim.x + threadIdx.x < num_elements;
+    value = warp_reduce_max(0xFFFFFFFF, active ? value : 0);
+
+    // Each warp writes its partial result to shared memory via the first lane
+
+    if (lane == 0) {
+        shared[warp] = value;
     }
-};
 
-struct gather_data {
-    __device__
-    Data operator()(uint16_t temperature) const {
-        return {
-            .temperature = temperature,
-        };
+    __syncthreads();
+
+    // Our partial results can now fit into a single warp, so we'll overwrite
+    // the first warp with the partial results from before
+
+    if (warp == 0) {
+        value = shared[lane];
+
+        // No synchronization is needed here, since the warp runs synchronously
+
+        bool active = blockIdx.x * blockDim.x + lane * warpSize < num_elements;
+        value = warp_reduce_max(0xFFFFFFFF, active ? value : 0);
     }
-};
+
+    return value;
+}
+
+__inline__ __device__
+double atomicMax(double* address, double val) {
+    double old = *address;
+    atomicMax(
+        reinterpret_cast<unsigned long long int*>(address),
+        *reinterpret_cast<unsigned long long int*>(&val)
+    );
+    return old;
+}
+
+//   Wavelengths ──►                  
+//   ┌─────────────────────────────────┐
+// S │ ┌───────┐┌───────┐┌───────┐     │
+// t │ │ Block ││ Block ││ Block │     │
+// a │ ├───────┤├───────┤├───────┤ ... │
+// r │ │ x ──► ││ x ──► ││ x ──► │     │
+// s │ └───────┘└───────┘└───────┘     │
+// │ │ ┌───────┐┌───────┐┌───────┐     │
+// │ │ │ Block ││ Block ││ Block │     │
+// ▼ │ ├───────┤├───────┤├───────┤ ... │
+//   │ │ x ──► ││ x ──► ││ x ──► │     │
+//   │ └───────┘└───────┘└───────┘     │
+//   │             ...                 │
+//   └─────────────────────────────────┘
+
+// https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/
+// https://developer.nvidia.com/blog/faster-parallel-reductions-kepler/
+// https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf
+
+__global__
+void temperature_kernel(
+    const size_t samples_per_spectra,
+    const float first_wavelength,
+    const float dispersion_per_pixel,
+    const double* d_model,
+    const double* d_redshift,
+    double* d_max_flux,
+    uint16_t* d_temperature
+) {
+    uint star_idx = blockIdx.y;
+    uint sample_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    double sample = d_model[star_idx * samples_per_spectra + sample_idx];
+
+    double block_max = block_reduce_max(sample, samples_per_spectra);
+
+    if (threadIdx.x == 0) {
+        atomicMax(d_max_flux + star_idx, block_max);
+    }
+
+    __syncthreads();
+
+    if (sample == d_max_flux[star_idx]) {
+        double redshift = d_redshift[star_idx];
+        double wavelength = __exp10f(first_wavelength + sample_idx * dispersion_per_pixel) / (1 + redshift);
+
+        d_temperature[star_idx] = WIEN_B / wavelength;
+    }
+}
 
 // Calculate temperatures by using Wien's displacement law:
 //
@@ -112,13 +176,15 @@ struct gather_data {
 // accept "dense" arrays that we can directly reinterpret as a row-major `double*`
 //
 // https://pybind11.readthedocs.io/en/stable/advanced/pycpp/numpy.html#arrays
-py::array_t<Data> temperatures(
+py::array_t<uint16_t> temperatures(
     py::array_t<double, py::array::c_style | py::array::forcecast> py_model,
     py::array_t<double, py::array::c_style | py::array::forcecast> py_redshift,
     float first_wavelength,
     float dispersion_per_pixel
 ) {
     LOG(INFO, "entering function");
+    
+    auto start = std::chrono::high_resolution_clock::now();
 
     py::buffer_info buf_model = py_model.request();
     py::buffer_info buf_redshift = py_redshift.request();
@@ -135,7 +201,7 @@ py::array_t<Data> temperatures(
         samples_per_spectra = buf_model.shape[0];
     }
 
-    LOG(INFO, "spectra_per_run=%zu samples_per_spectra=%zu", spectra_per_run, samples_per_spectra);
+    LOG(INFO, "spectra_per_run=%zu, samples_per_spectra=%zu", spectra_per_run, samples_per_spectra);
 
     if (buf_redshift.ndim != 1) {
         LOG(ERROR, "buf_redshift.size=%zu", buf_redshift.size);
@@ -147,91 +213,67 @@ py::array_t<Data> temperatures(
         throw std::runtime_error("expected `redshift` to have same dimension on axis 0 as `model`");
     }
 
-    auto start = std::chrono::steady_clock::now();
-
     double* model = reinterpret_cast<double*>(buf_model.ptr);
     double* redshift = reinterpret_cast<double*>(buf_redshift.ptr);
 
-    thrust::device_vector<double> d_model(model, model + buf_model.size);
-    thrust::device_vector<double> d_redshift(redshift, redshift + buf_redshift.size);
+    double* d_model;
+    double* d_redshift;
 
-    // The star index will act as our key in the following reduction,
-    // since we want to get the highest-flux wavelength for EACH star.
+    CUDA_CHECK( cudaMalloc(&d_model, buf_model.size * sizeof(double)) );
+    CUDA_CHECK( cudaMalloc(&d_redshift, buf_redshift.size * sizeof(double)) );
+    CUDA_CHECK( cudaMemcpy(d_model, model, buf_model.size * sizeof(double), cudaMemcpyHostToDevice) );
+    CUDA_CHECK( cudaMemcpy(d_redshift, redshift, buf_redshift.size * sizeof(double), cudaMemcpyHostToDevice) );
 
-    auto idx_begin = thrust::make_counting_iterator<size_t>(0);
-    auto idx_end = thrust::make_counting_iterator<size_t>(buf_size);
+    double* d_max_flux;
+    uint16_t* d_temperature;
 
-    auto idx_star_begin = thrust::make_transform_iterator(idx_begin, thrust::placeholders::_1 / samples_per_spectra);
-    auto idx_star_end = thrust::make_transform_iterator(idx_end, thrust::placeholders::_1 / samples_per_spectra);
+    CUDA_CHECK( cudaMalloc(&d_max_flux, spectra_per_run * sizeof(double)) );
+    CUDA_CHECK( cudaMalloc(&d_temperature, spectra_per_run * sizeof(uint16_t)) );
 
-    auto idx_sample_begin = thrust::make_transform_iterator(idx_begin, thrust::placeholders::_1 % samples_per_spectra);
+    size_t blocks_per_spectra = ceil((float) samples_per_spectra / 1024);
 
-    LOG(INFO, "calling `reduce_by_key`");
+    auto kernel_start = std::chrono::high_resolution_clock::now();
 
-    // First we find the index where the maximum flux occurs
-    thrust::device_vector<size_t> d_max_flux_idx(spectra_per_run);
-    thrust::reduce_by_key(
-        idx_star_begin,
-        idx_star_end,
-        thrust::make_zip_iterator(thrust::make_tuple(
-            idx_sample_begin,
-            d_model.begin()
-        )),
-        thrust::make_discard_iterator(), // We don't care about the index of the star in the output
-        thrust::make_zip_iterator(thrust::make_tuple(
-            d_max_flux_idx.begin(), 
-            thrust::make_discard_iterator() // We don't care about the value of the peak
-        )),
-        thrust::equal_to<size_t>(),
-        max_flux_idx()
+    temperature_kernel<<<dim3(blocks_per_spectra, spectra_per_run), 1024>>>(
+        samples_per_spectra,
+        first_wavelength,
+        dispersion_per_pixel,
+        d_model,
+        d_redshift,
+        d_max_flux,
+        d_temperature
     );
 
-    LOG(INFO, "calling `transform`");
+    auto kernel_end = std::chrono::high_resolution_clock::now();
 
-    thrust::device_vector<uint16_t> d_temperatures(spectra_per_run);
-    thrust::transform(
-        thrust::make_zip_iterator(thrust::make_tuple(
-            idx_star_begin,
-            d_max_flux_idx.begin(),
-            d_redshift.begin()
-        )),
-        thrust::make_zip_iterator(thrust::make_tuple(
-            idx_star_end,
-            d_max_flux_idx.end(),
-            d_redshift.end()
-        )),
-        d_temperatures.begin(),
-        get_temperature(samples_per_spectra, first_wavelength, dispersion_per_pixel)
-    );
+    CUDA_CHECK( cudaDeviceSynchronize() );
+    CUDA_CHECK( cudaGetLastError() );
 
-    LOG(INFO, "calling `transform`");
+    LOG(INFO, "kernel finished in %ldµs", (kernel_end - kernel_start) / 1us);
 
-    thrust::device_vector<Data> d_data(spectra_per_run);
-    thrust::transform(
-        d_temperatures.begin(),
-        d_temperatures.end(),
-        d_data.begin(),
-        gather_data()
-    );
+    uint16_t temperature[spectra_per_run];
 
-    thrust::host_vector<Data> data(d_data);
+    CUDA_CHECK( cudaMemcpy(&temperature, d_temperature, spectra_per_run * sizeof(uint16_t), cudaMemcpyDeviceToHost) );
 
-    auto end = std::chrono::steady_clock::now();
+    CUDA_CHECK( cudaFree(d_model) );
+    CUDA_CHECK( cudaFree(d_redshift) );
+    CUDA_CHECK( cudaFree(d_max_flux) );
+    CUDA_CHECK( cudaFree(d_temperature) );
 
-    LOG(INFO, "finished in %ldms", (end - start) / 1ms);
+    auto end = std::chrono::high_resolution_clock::now();
 
-    return py::array_t<Data>(
+    LOG(INFO, "finished in %ldµs", (kernel_end - kernel_start) / 1us);
+
+    return py::array_t<uint16_t>(
         { spectra_per_run },
-        { sizeof(Data) },
-        thrust::raw_pointer_cast(data.data())
+        { sizeof(uint16_t) },
+        temperature
     );
 }
 
 // Define the Python FFI bindings
 PYBIND11_MODULE(stargaze, m)
 {
-    PYBIND11_NUMPY_DTYPE(Data, temperature);
-
     m.doc() = "";
     m.def(
         "temperatures",
