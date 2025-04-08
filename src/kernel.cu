@@ -114,7 +114,7 @@ double atomicMax(double* address, double val) {
     return old;
 }
 
-//   Wavelengths ──►                  
+//   Wavelengths ──►
 //   ┌─────────────────────────────────┐
 // S │ ┌───────┐┌───────┐┌───────┐     │
 // t │ │ Block ││ Block ││ Block │     │
@@ -183,7 +183,7 @@ py::array_t<uint16_t> temperatures(
     float dispersion_per_pixel
 ) {
     LOG(INFO, "entering function");
-    
+
     auto start = std::chrono::high_resolution_clock::now();
 
     py::buffer_info buf_model = py_model.request();
@@ -272,7 +272,7 @@ py::array_t<uint16_t> temperatures(
 }
 
 // Define the Python FFI bindings
-PYBIND11_MODULE(stargaze, m)
+PYBIND11_MODULE(kernel, m)
 {
     m.doc() = "";
     m.def(

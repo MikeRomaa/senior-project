@@ -451,4 +451,5 @@ cmake
 rapids-cmake
 cpm-package-lock.cmake
 CPM_modules
-stargaze.so
+kernel.so
+fits
